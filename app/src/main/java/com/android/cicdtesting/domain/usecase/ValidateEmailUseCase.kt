@@ -11,6 +11,5 @@ class ValidateEmailUseCaseImpl : ValidateEmailUseCase {
     private val pattern = Regex("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$")
 
     override fun invoke(email: String): Boolean =
-        email.isNotBlank()
-                && pattern.matches(email)
+        email.isNotBlank() && pattern.matches(email)
 }
