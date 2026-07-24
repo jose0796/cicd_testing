@@ -1,0 +1,150 @@
+name: Manual PR Validation
+
+# Triggered by commenting "/run-tests" on a pull request (or manually from the
+# Actions tab with a PR number). The job checks out the PR's head commit,
+# builds the project, runs the unit tests, and posts a commit status
+# ("Manual PR Validation") back to the PR.
+#
+# To make a failing (or missing) run BLOCK the PR, add a branch protection
+# rule (or ruleset) on your base branch with "Require status checks to pass"
+# and select the "Manual PR Validation" context. The PR then cannot be merged
+# until this workflow has been run for its latest commit and succeeded.
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to validate"
+        required: true
+        type: string
+
+run-name: "PR validation triggered by @${{ github.actor }}"
+
+concurrency:
+  group: manual-pr-validation-${{ github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  statuses: write
+  issues: write
+
+jobs:
+  build-and-test:
+    name: Build & Test PR
+    runs-on: ubuntu-latest
+    # Run when manually dispatched, or when someone comments "/run-tests" on a PR.
+    # (issue_comment also fires for plain issues; github.event.issue.pull_request
+    # is only present when the comment is on a pull request.)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/run-tests'))
+
+    env:
+      PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
+
+    steps:
+      - name: React to the triggering comment
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: "rocket",
+            });
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.issue.number || inputs.pr_number }}/head
+
+      - name: Resolve PR head SHA
+        id: pr
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Mark commit status as pending
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: "pending",
+              context: "Manual PR Validation",
+              description: "Build and unit tests running...",
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Assemble debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-${{ github.event.issue.number || inputs.pr_number }}-test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
+
+      - name: Report final commit status to the PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const success = process.env.JOB_STATUS === "success";
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: success ? "success" : "failure",
+              context: "Manual PR Validation",
+              description: success
+                ? "Build and unit tests passed"
+                : "Build or unit tests failed - PR is blocked",
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+      - name: Comment result on the PR
+        if: always() && github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        env:
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const success = process.env.JOB_STATUS === "success";
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: success
+                ? `✅ **Build and unit tests passed.** ([run](${runUrl}))`
+                : `❌ **Build or unit tests failed.** This PR is blocked until a re-run succeeds. ([run](${runUrl}))`,
+            });
