@@ -20,7 +20,9 @@ class GetUserUseCaseImpl(
     private val repository: UserRepository,
 ) : GetUserUseCase {
     override suspend fun invoke(id: String): User? {
-        require(id.isNotBlank()) { "id must not be blank" }
+        require(id.isNotBlank()) {
+            "id must not be blank"
+        }
         return repository.findById(id)
     }
 }
