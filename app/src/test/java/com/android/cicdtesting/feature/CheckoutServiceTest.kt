@@ -63,4 +63,36 @@ class CheckoutServiceTest {
         assertEquals(CheckoutResult.Failure("Invalid email"), result)
         verify(exactly = 0) { calculateDiscount(any(), any()) }
     }
+
+    @Test
+    fun `checkout passes the user premium flag to the discount calculation`() = runTest {
+        val user = User(id = "3", name = "Cleo", email = "cleo@example.com", isPremium = false)
+        coEvery { getUser("3") } returns user
+        every { validateEmail("cleo@example.com") } returns true
+        every { calculateDiscount(80.0, false) } returns 80.0
+
+        service.checkout(userId = "3", cartTotal = 80.0)
+
+        verify(exactly = 1) { calculateDiscount(80.0, false) }
+        verify(exactly = 0) { calculateDiscount(any(), true) }
+    }
+
+    @Test
+    fun `checkout succeeds with a zero cart total`() = runTest {
+        val user = User(id = "4", name = "Dan", email = "dan@example.com", isPremium = true)
+        coEvery { getUser("4") } returns user
+        every { validateEmail("dan@example.com") } returns true
+        every { calculateDiscount(0.0, true) } returns 0.0
+
+        val result = service.checkout(userId = "4", cartTotal = 0.0)
+
+        assertEquals(CheckoutResult.Success(0.0), result)
+    }
+
+    @Test(expected = IllegalStateException::class)
+    fun `checkout propagates unexpected use case errors`() = runTest {
+        coEvery { getUser("boom") } throws IllegalStateException("backend down")
+
+        service.checkout(userId = "boom", cartTotal = 10.0)
+    }
 }
