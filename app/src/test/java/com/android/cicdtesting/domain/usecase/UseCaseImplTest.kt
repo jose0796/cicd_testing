@@ -21,9 +21,31 @@ class ValidateEmailUseCaseImplTest {
     }
 
     @Test
+    fun `accepts subdomains and plus addressing`() {
+        assertTrue(validate("ada@mail.example.co.uk"))
+        assertTrue(validate("ada+spam@example.com"))
+        assertTrue(validate("first.last-name_1@example.io"))
+    }
+
+    @Test
     fun `rejects a malformed email`() {
         assertFalse(validate("nope"))
         assertFalse(validate(""))
+    }
+
+    @Test
+    fun `rejects missing local part or domain`() {
+        assertFalse(validate("@example.com"))
+        assertFalse(validate("ada@"))
+        assertFalse(validate("ada@example"))
+    }
+
+    @Test
+    fun `rejects whitespace and double at signs`() {
+        assertFalse(validate("ada @example.com"))
+        assertFalse(validate("ada@exa mple.com"))
+        assertFalse(validate("ada@@example.com"))
+        assertFalse(validate("   "))
     }
 }
 
@@ -43,6 +65,23 @@ class CalculateDiscountUseCaseImplTest {
     @Test
     fun `small non premium orders get no discount`() {
         assertEquals(50.0, calculate(50.0, false), 0.0001)
+    }
+
+    @Test
+    fun `exactly 100 is not discounted for non premium users`() {
+        // The threshold is strictly greater than 100.
+        assertEquals(100.0, calculate(100.0, false), 0.0001)
+    }
+
+    @Test
+    fun `premium discount applies even to small orders`() {
+        assertEquals(8.0, calculate(10.0, true), 0.0001)
+    }
+
+    @Test
+    fun `zero price stays zero`() {
+        assertEquals(0.0, calculate(0.0, false), 0.0001)
+        assertEquals(0.0, calculate(0.0, true), 0.0001)
     }
 
     @Test(expected = IllegalArgumentException::class)
