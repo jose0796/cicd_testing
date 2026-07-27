@@ -14,7 +14,8 @@ class CalculateDiscountUseCaseImpl : CalculateDiscountUseCase {
         require(price >= 0) { "price must not be negative" }
         val rate = when {
             isPremium -> 0.20
-            price > 100.0 -> 0.05
+            price > 100.0 ->
+                0.05
             else -> 0.0
         }
         return price * (1 - rate)
