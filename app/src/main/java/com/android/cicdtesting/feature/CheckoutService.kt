@@ -25,7 +25,8 @@ class CheckoutService(
         val user = getUser(userId)
             ?: return CheckoutResult.Failure("User not found")
 
-        if (!validateEmail(user.email)) {
+        if (!validateEmail(user.email))
+        {
             return CheckoutResult.Failure("Invalid email")
         }
 
