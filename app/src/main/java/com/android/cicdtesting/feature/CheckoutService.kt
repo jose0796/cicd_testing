@@ -29,6 +29,7 @@ class CheckoutService(
         {
             return CheckoutResult.Failure("Invalid email")
         }
+        if (!validateEmail(user.email)) return CheckoutResult.Failure("Invalid email")
 
         val finalPrice = calculateDiscount(cartTotal, user.isPremium)
         return CheckoutResult.Success(finalPrice)
