@@ -1,226 +1,119 @@
-name: Manual PR Validation
+name: Build and test on demand
 
-# Triggered by commenting "/run-tests" on a pull request (or manually from the
-# Actions tab with a PR number). The job checks out the PR's head commit,
-# builds the project, runs the unit tests, and posts a commit status
-# ("Manual PR Validation") back to the PR.
-#
-# To make a failing (or missing) run BLOCK the PR, add a branch protection
-# rule (or ruleset) on your base branch with "Require status checks to pass"
-# and select the "Manual PR Validation" context. The PR then cannot be merged
-# until this workflow has been run for its latest commit and succeeded.
-
+# Triggered by a repository owner, member, or collaborator commenting exactly
+# 'run-tests' on a pull request. Reports the result as the 'manual/run-tests'
+# commit status on the PR head commit, so it can be configured as a required
+# status check for merging.
 on:
   issue_comment:
     types: [created]
-  # Fired by GitHub Merge Queue for the temporary merge commits it creates.
-  merge_group:
-  workflow_dispatch:
-    inputs:
-      pr_number:
-        description: "Pull request number to validate"
-        required: true
-        type: string
 
-run-name: "PR validation triggered by @${{ github.actor }}"
-
-concurrency:
-  group: manual-pr-validation-${{ github.event.issue.number || inputs.pr_number || github.run_id }}
-  cancel-in-progress: true
-
-# NOTE: comments and reactions on a *pull request* belong to the
-# pull-requests resource, not issues, even though the REST API paths go
-# through /issues/. Granting only issues:write causes 403
-# "Resource not accessible by integration".
 permissions:
   contents: read
+  pull-requests: read
   statuses: write
-  pull-requests: write
+
+concurrency:
+  group: run-tests-pr-${{ github.event.issue.number }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
-    name: Build & Test PR
-    runs-on: ubuntu-latest
-    # Run when manually dispatched, or when someone comments "/run-tests" on a PR.
-    # (issue_comment also fires for plain issues; github.event.issue.pull_request
-    # is only present when the comment is on a pull request.)
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.issue.pull_request &&
-       startsWith(github.event.comment.body, '/run-tests'))
-
+      github.event.issue.pull_request != null &&
+      github.event.comment.body == 'run-tests' &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
-      PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
-
+      PR_NUMBER: ${{ github.event.issue.number }}
+      STATUS_CONTEXT: manual/run-tests
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - name: React to the triggering comment
-        if: github.event_name == 'issue_comment'
-        # Cosmetic only - never fail the validation over a reaction.
-        continue-on-error: true
-        uses: actions/github-script@v8
-        with:
-          script: |
-            await github.rest.reactions.createForIssueComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              comment_id: context.payload.comment.id,
-              content: "rocket",
-            });
-
-      # Resolve the PR head SHA through the API *before* checking anything
-      # out. This validates the PR number early and guarantees the status
-      # steps below always have a real SHA to report against.
-      - name: Resolve PR head SHA
+      - name: Resolve PR head commit
         id: pr
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const prNumber = Number(process.env.PR_NUMBER);
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-            });
-            core.setOutput("sha", pr.head.sha);
-            core.info(`Validating PR #${prNumber} (${pr.head.ref}) at ${pr.head.sha}`);
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PR_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          HEAD_SHA="$(jq -r '.head.sha' <<< "${PR_JSON}")"
+          HEAD_REPO="$(jq -r '.head.repo.full_name' <<< "${PR_JSON}")"
+          PR_STATE="$(jq -r '.state' <<< "${PR_JSON}")"
+
+          if [[ "${PR_STATE}" != "open" ]]; then
+            echo "::error::PR #${PR_NUMBER} is not open."
+            exit 1
+          fi
+
+          # Do not run code from forks with a token that can write statuses.
+          if [[ "${HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]]; then
+            echo "::error::'run-tests' is only supported on same-repository branches, not forks."
+            exit 1
+          fi
+
+          echo "head-sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Mark commit status as pending
-        uses: actions/github-script@v8
         env:
-          HEAD_SHA: ${{ steps.pr.outputs.sha }}
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: process.env.HEAD_SHA,
-              state: "pending",
-              context: "Manual PR Validation",
-              description: "Build and unit tests running...",
-              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.head-sha }}
+        run: |
+          set -euo pipefail
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state='pending' \
+            -f context="${STATUS_CONTEXT}" \
+            -f description='Build and tests running' \
+            -f target_url="${RUN_URL}" >/dev/null
 
-      - name: Checkout PR head
-        uses: actions/checkout@v5
+      - name: Checkout PR head commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ steps.pr.outputs.sha }}
+          ref: ${{ steps.pr.outputs.head-sha }}
+          # Do not leave the token in .git/config where PR build scripts could read it.
+          persist-credentials: false
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
-          java-version: "21"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+          java-version: '17'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
 
-      - name: Run unit tests
-        run: ./gradlew testDebugUnitTest --stacktrace
-
-      - name: Assemble debug APK
-        run: ./gradlew assembleDebug --stacktrace
+      # No token in the environment: this step runs code controlled by the PR branch.
+      - name: Build and run unit tests
+        run: ./gradlew assembleDebug testDebugUnitTest --stacktrace
 
       - name: Upload test reports
-        if: always()
-        uses: actions/upload-artifact@v4
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: pr-${{ github.event.issue.number || inputs.pr_number }}-test-reports
-          path: app/build/reports/tests/
+          name: unit-test-reports
+          path: '**/build/reports/tests/'
           if-no-files-found: ignore
 
-      # Only report a status if we managed to resolve the PR head SHA;
-      # posting with an empty SHA would 404.
-      - name: Report final commit status to the PR
-        if: always() && steps.pr.outputs.sha != ''
-        uses: actions/github-script@v8
+      - name: Report final commit status
+        if: always() && steps.pr.outputs.head-sha != ''
         env:
-          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.head-sha }}
           JOB_STATUS: ${{ job.status }}
-        with:
-          script: |
-            const success = process.env.JOB_STATUS === "success";
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: process.env.HEAD_SHA,
-              state: success ? "success" : "failure",
-              context: "Manual PR Validation",
-              description: success
-                ? "Build and unit tests passed"
-                : "Build or unit tests failed - PR is blocked",
-              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
-
-      - name: Comment result on the PR
-        if: always() && github.event_name == 'issue_comment'
-        uses: actions/github-script@v8
-        env:
-          JOB_STATUS: ${{ job.status }}
-        with:
-          script: |
-            const success = process.env.JOB_STATUS === "success";
-            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: success
-                ? `✅ **Build and unit tests passed.** ([run](${runUrl}))`
-                : `❌ **Build or unit tests failed.** This PR is blocked until a re-run succeeds. ([run](${runUrl}))`,
-            });
-
-  # Runs inside the Merge Queue: re-builds and re-tests the temporary merge
-  # commit (PR + latest main), then reports the same "Manual PR Validation"
-  # status context on it. If this fails, the queue kicks the PR out instead
-  # of merging it.
-  merge-queue-validation:
-    name: Build & Test (Merge Queue)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'merge_group'
-
-    steps:
-      # For merge_group events the default checkout is already the merge
-      # group's head commit.
-      - name: Checkout merge group
-        uses: actions/checkout@v5
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Run unit tests
-        run: ./gradlew testDebugUnitTest --stacktrace
-
-      - name: Assemble debug APK
-        run: ./gradlew assembleDebug --stacktrace
-
-      - name: Report status on the merge group commit
-        if: always()
-        uses: actions/github-script@v8
-        env:
-          JOB_STATUS: ${{ job.status }}
-        with:
-          script: |
-            const success = process.env.JOB_STATUS === "success";
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.payload.merge_group.head_sha,
-              state: success ? "success" : "failure",
-              context: "Manual PR Validation",
-              description: success
-                ? "Merge group build and tests passed"
-                : "Merge group build or tests failed",
-              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
+        run: |
+          set -euo pipefail
+          if [[ "${JOB_STATUS}" == "success" ]]; then
+            STATE='success'
+            DESCRIPTION='Build and tests passed'
+          else
+            STATE='failure'
+            DESCRIPTION='Build or tests failed'
+          fi
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="${STATE}" \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="${DESCRIPTION}" \
+            -f target_url="${RUN_URL}" >/dev/null
