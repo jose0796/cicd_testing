@@ -4,36 +4,43 @@ name: Build and test on demand
 # 'run-tests' on a pull request. Reports the result as the 'manual/run-tests'
 # commit status on the PR head commit, so it can be configured as a required
 # status check for merging.
+#
+# Privileged status updates are isolated in jobs that never check out or run
+# PR-controlled code: the 'build' job runs Gradle from the PR branch with
+# contents:read only, so it can neither leak a status-write token nor spoof
+# the required status.
 on:
   issue_comment:
     types: [created]
 
 permissions:
   contents: read
-  pull-requests: read
-  statuses: write
 
 concurrency:
   group: run-tests-pr-${{ github.event.issue.number }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
+  prepare:
     if: >-
       github.event.issue.pull_request != null &&
       github.event.comment.body == 'run-tests' &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      statuses: write
+    outputs:
+      head-sha: ${{ steps.pr.outputs.head-sha }}
     env:
+      GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event.issue.number }}
       STATUS_CONTEXT: manual/run-tests
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Resolve PR head commit
         id: pr
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -47,7 +54,7 @@ jobs:
             exit 1
           fi
 
-          # Do not run code from forks with a token that can write statuses.
+          # Do not run code from forks in a workflow that can write statuses.
           if [[ "${HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]]; then
             echo "::error::'run-tests' is only supported on same-repository branches, not forks."
             exit 1
@@ -57,7 +64,6 @@ jobs:
 
       - name: Mark commit status as pending
         env:
-          GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head-sha }}
         run: |
           set -euo pipefail
@@ -68,10 +74,17 @@ jobs:
             -f description='Build and tests running' \
             -f target_url="${RUN_URL}" >/dev/null
 
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
       - name: Checkout PR head commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ steps.pr.outputs.head-sha }}
+          ref: ${{ needs.prepare.outputs.head-sha }}
           # Do not leave the token in .git/config where PR build scripts could read it.
           persist-credentials: false
 
@@ -84,7 +97,6 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
 
-      # No token in the environment: this step runs code controlled by the PR branch.
       - name: Build and run unit tests
         run: ./gradlew assembleDebug testDebugUnitTest --stacktrace
 
@@ -96,20 +108,29 @@ jobs:
           path: '**/build/reports/tests/'
           if-no-files-found: ignore
 
+  report:
+    needs: [prepare, build]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ needs.prepare.outputs.head-sha }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      STATUS_CONTEXT: manual/run-tests
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
       - name: Report final commit status
-        if: always() && steps.pr.outputs.head-sha != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ steps.pr.outputs.head-sha }}
-          JOB_STATUS: ${{ job.status }}
         run: |
           set -euo pipefail
-          if [[ "${JOB_STATUS}" == "success" ]]; then
+          if [[ "${BUILD_RESULT}" == "success" ]]; then
             STATE='success'
             DESCRIPTION='Build and tests passed'
           else
             STATE='failure'
-            DESCRIPTION='Build or tests failed'
+            DESCRIPTION="Build or tests failed (${BUILD_RESULT})"
           fi
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
